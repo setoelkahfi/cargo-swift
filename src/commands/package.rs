@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use camino::Utf8PathBuf;
-use cargo_metadata::Package;
-use clap::ValueEnum;
+use cargo_metadata::{Package, TargetKind};
+use clap::builder::TypedValueParser;
+use clap::{Args, ValueEnum};
 use convert_case::{Case, Casing};
 use dialoguer::{Input, MultiSelect};
 use execute::{command, Execute};
@@ -57,7 +58,7 @@ pub struct FeatureOptions {
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
-    platforms: Option<Vec<Platform>>,
+    platforms: Option<Vec<PlatformSpec>>,
     build_target: Option<&str>,
     package_name: Option<String>,
     xcframework_name: Option<String>,
@@ -67,7 +68,17 @@ pub fn run(
     lib_type_arg: LibTypeArg,
     features: FeatureOptions,
     skip_toolchains_check: bool,
+    swift_tools_version: &str,
 ) -> Result<()> {
+    // Show deprecation warning if --xcframework-name is used
+    if xcframework_name.is_some() {
+        warning!(
+            &config,
+            "The --xcframework-name flag is deprecated and will be removed in a future release. \
+             The xcframework name is now derived from the FFI module name in uniffi.toml."
+        );
+    }
+
     // TODO: Allow path as optional argument to take other directories than current directory
     // let crates = metadata().uniffi_crates();
     let crates = [metadata()
@@ -87,6 +98,7 @@ pub fn run(
             lib_type_arg,
             features,
             skip_toolchains_check,
+            swift_tools_version,
         );
     } else if package_name.is_some() {
         Err("Package name can only be specified when building a single crate!")?;
@@ -108,6 +120,7 @@ pub fn run(
                 lib_type_arg.clone(),
                 features.clone(),
                 skip_toolchains_check,
+                swift_tools_version,
             )
         })
         .filter_map(|result| result.err())
@@ -118,7 +131,7 @@ pub fn run(
 #[allow(clippy::too_many_arguments)]
 fn run_for_crate(
     current_crate: &Package,
-    platforms: Option<Vec<Platform>>,
+    platforms: Option<Vec<PlatformSpec>>,
     build_target: Option<&str>,
     package_name: Option<String>,
     xcframework_name: Option<String>,
@@ -128,16 +141,17 @@ fn run_for_crate(
     lib_type_arg: LibTypeArg,
     features: FeatureOptions,
     skip_toolchains_check: bool,
+    swift_tools_version: &str,
 ) -> Result<()> {
     let lib = current_crate
         .targets
         .iter()
-        .find(|t| t.kind.contains(&"lib".to_owned()))
+        .find(|t| t.kind.contains(&TargetKind::Lib))
         .ok_or("No library tag defined in Cargo.toml!")?;
     let lib_types = lib
         .crate_types
         .iter()
-        .filter_map(|t| t.parse().ok())
+        .filter_map(|t| t.clone().try_into().ok())
         .collect::<Vec<_>>();
     let lib_type = pick_lib_type(&lib_types, lib_type_arg.clone().into(), config)?;
 
@@ -163,8 +177,8 @@ fn run_for_crate(
     }
 
     let mut targets: Vec<_> = platforms
-        .into_iter()
-        .flat_map(|p| p.into_apple_platforms())
+        .iter()
+        .flat_map(|p| p.platform.into_apple_platforms())
         .map(|p| p.target())
         .collect();
 
@@ -196,19 +210,27 @@ fn run_for_crate(
         }
     }
 
-    if !skip_toolchains_check {
-        let missing_toolchains = check_installed_toolchains(&targets);
-        let nightly_toolchains = check_nightly_installed(&targets);
+    let toolchain_targets = ToolchainTargets::query(&targets);
 
-        let installation_required =
-            &[missing_toolchains.as_slice(), nightly_toolchains.as_slice()].concat();
+    if !skip_toolchains_check {
+        let missing_stable = check_stable_missing_targets(&targets, &toolchain_targets);
+        let missing_nightly_targets = check_nightly_missing_targets(&targets, &toolchain_targets);
+        let missing_nightly_src = check_nightly_src_installed(&targets, &toolchain_targets);
+
+        let installation_required = &[
+            missing_stable.as_slice(),
+            missing_nightly_targets.as_slice(),
+            missing_nightly_src.as_slice(),
+        ]
+        .concat();
 
         if !installation_required.is_empty() {
             if config.accept_all || prompt_toolchain_installation(installation_required) {
-                install_toolchains(&missing_toolchains, config.silent)?;
-                if !nightly_toolchains.is_empty() {
+                install_toolchains(&missing_stable, config.silent)?;
+                if !missing_nightly_targets.is_empty() || !missing_nightly_src.is_empty() {
                     install_nightly_src(config.silent)?;
                 }
+                install_nightly_targets(&missing_nightly_targets, config.silent)?;
             } else {
                 Err("Toolchains for some target platforms were missing!")?;
             }
@@ -217,10 +239,22 @@ fn run_for_crate(
 
     let crate_name = lib.name.replace('-', "_");
     for target in &targets {
-        build_with_output(target, &crate_name, mode, lib_type, config, &features)?;
+        build_with_output(
+            target,
+            &crate_name,
+            mode,
+            lib_type,
+            config,
+            &features,
+            &toolchain_targets,
+        )?;
     }
 
-    generate_bindings_with_output(&targets, &crate_name, mode, lib_type, config)?;
+    let ffi_module_name =
+        generate_bindings_with_output(&targets, &crate_name, mode, lib_type, config)?;
+
+    // Use the FFI module name as the xcframework name by default
+    let xcframework_name = xcframework_name.unwrap_or_else(|| ffi_module_name.clone());
 
     recreate_output_dir(&package_name).expect("Could not create package output directory!");
     create_xcframework_with_output(
@@ -228,11 +262,19 @@ fn run_for_crate(
         &crate_name,
         &package_name,
         &xcframework_name,
+        &ffi_module_name,
         mode,
         lib_type,
         config,
     )?;
-    create_package_with_output(&package_name, &xcframework_name, disable_warnings, config)?;
+    create_package_with_output(
+        &package_name,
+        &xcframework_name,
+        disable_warnings,
+        &platforms,
+        swift_tools_version,
+        config,
+    )?;
 
     Ok(())
 }
@@ -249,6 +291,7 @@ pub enum Platform {
     Tvos,
     Watchos,
     Visionos,
+    Maccatalyst,
 }
 
 impl Platform {
@@ -259,6 +302,7 @@ impl Platform {
             Platform::Tvos => vec![ApplePlatform::TvOS, ApplePlatform::TvOSSimulator],
             Platform::Watchos => vec![ApplePlatform::WatchOS, ApplePlatform::WatchOSSimulator],
             Platform::Visionos => vec![ApplePlatform::VisionOS, ApplePlatform::VisionOSSimulator],
+            Platform::Maccatalyst => vec![ApplePlatform::MacCatalyst],
         }
     }
 
@@ -269,6 +313,7 @@ impl Platform {
             Platform::Tvos => "tvOS",
             Platform::Watchos => "watchOS",
             Platform::Visionos => "visionOS",
+            Platform::Maccatalyst => "Mac Catalyst",
         };
 
         format!(
@@ -284,7 +329,7 @@ impl Platform {
     fn is_experimental(&self) -> bool {
         match self {
             Platform::Macos | Platform::Ios => false,
-            Platform::Tvos | Platform::Watchos | Platform::Visionos => true,
+            Platform::Tvos | Platform::Watchos | Platform::Visionos | Platform::Maccatalyst => true,
         }
     }
 
@@ -299,12 +344,80 @@ impl Platform {
     }
 }
 
-fn prompt_platforms(accept_all: bool) -> Vec<Platform> {
+#[derive(Debug, Clone, Args)]
+pub struct PlatformSpec {
+    pub platform: Platform,
+    pub min_version: Option<String>,
+}
+
+impl PlatformSpec {
+    pub(crate) fn package_swift(&self) -> String {
+        let v = self.min_version.as_deref();
+        match self.platform {
+            Platform::Macos => format!(".macOS(.v{})", v.unwrap_or("10_15")),
+            Platform::Ios => format!(".iOS(.v{})", v.unwrap_or("13")),
+            Platform::Tvos => format!(".tvOS(.v{})", v.unwrap_or("13")),
+            Platform::Watchos => format!(".watchOS(.v{})", v.unwrap_or("6")),
+            Platform::Visionos => format!(".visionOS(.v{})", v.unwrap_or("1")),
+            Platform::Maccatalyst => format!(".macCatalyst(.v{})", v.unwrap_or("13")),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PlatformSpecParser;
+
+impl TypedValueParser for PlatformSpecParser {
+    type Value = PlatformSpec;
+
+    fn parse_ref(
+        &self,
+        _cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> clap::error::Result<Self::Value> {
+        let s = value.to_string_lossy();
+
+        let (platform_str, min_version) = match s.split_once('@') {
+            Some((p, v)) => (p, Some(v.to_string())),
+            None => (s.as_ref(), None),
+        };
+
+        let platform = Platform::from_str(platform_str, true).map_err(|_| {
+            clap::error::Error::raw(
+                clap::error::ErrorKind::InvalidValue,
+                format!("invalid platform `{}`", platform_str),
+            )
+        })?;
+
+        Ok(PlatformSpec {
+            platform,
+            min_version,
+        })
+    }
+
+    fn possible_values(&self) -> Option<Box<dyn Iterator<Item = clap::builder::PossibleValue>>> {
+        Some(Box::new(
+            Platform::value_variants()
+                .iter()
+                .filter_map(|v| v.to_possible_value()),
+        ))
+    }
+}
+
+fn prompt_platforms(accept_all: bool) -> Vec<PlatformSpec> {
     let platforms = Platform::all();
     let items = platforms.map(|p| p.display_name());
 
     if accept_all {
-        return platforms.to_vec();
+        return platforms
+            .into_iter()
+            .filter(|p| !p.is_experimental())
+            .map(|platform| PlatformSpec {
+                platform,
+                min_version: None,
+            })
+            .collect();
     }
 
     let theme = prompt_theme();
@@ -317,44 +430,55 @@ fn prompt_platforms(accept_all: bool) -> Vec<Platform> {
 
     let chosen: Vec<usize> = selector.interact().unwrap();
 
-    chosen.into_iter().map(|i| platforms[i]).collect()
-}
-
-/// Checks if toolchains for all target architectures are installed and returns a
-/// list containing the names of all missing toolchains
-fn check_installed_toolchains(targets: &[Target]) -> Vec<&'static str> {
-    let mut rustup = command!("rustup target list");
-    rustup.stdout(Stdio::piped());
-    let output = rustup
-        .execute_output()
-        .expect("Failed to check installed toolchains. Is rustup installed on your system?");
-    let output = String::from_utf8_lossy(&output.stdout);
-
-    let installed: Vec<_> = output
-        .split('\n')
-        .filter(|s| s.contains("installed"))
-        .map(|s| s.replace("(installed)", "").trim().to_owned())
-        .collect();
-
-    targets
-        .iter()
-        .filter(|t| !t.platform().is_tier_3())
-        .flat_map(|t| t.architectures())
-        .filter(|arch| {
-            !installed
-                .iter()
-                .any(|toolchain| toolchain.eq_ignore_ascii_case(arch))
+    chosen
+        .into_iter()
+        .map(|i| PlatformSpec {
+            platform: platforms[i],
+            min_version: None,
         })
         .collect()
 }
 
-/// Checks if rust-src component for tier 3 targets are installed
-fn check_nightly_installed(targets: &[Target]) -> Vec<&'static str> {
-    if !targets.iter().any(|t| t.platform().is_tier_3()) {
+/// Checks if toolchains for all tier 1/2 target architectures are installed on the
+/// default (stable) toolchain and returns a list of missing ones.
+fn check_stable_missing_targets(
+    targets: &[Target],
+    toolchain_targets: &ToolchainTargets,
+) -> Vec<&'static str> {
+    targets
+        .iter()
+        .flat_map(|t| t.architectures())
+        .filter(|arch| toolchain_targets.is_stable_missing(arch))
+        .collect()
+}
+
+/// Checks if targets that are only available on nightly (tier 2 on nightly, tier 3 on stable)
+/// are installed on the nightly toolchain.
+fn check_nightly_missing_targets(
+    targets: &[Target],
+    toolchain_targets: &ToolchainTargets,
+) -> Vec<&'static str> {
+    targets
+        .iter()
+        .flat_map(|t| t.architectures())
+        .filter(|arch| toolchain_targets.is_nightly_missing(arch))
+        .collect()
+}
+
+/// Checks if rust-src component for tier 3 targets (needing -Z build-std) is installed
+fn check_nightly_src_installed(
+    targets: &[Target],
+    toolchain_targets: &ToolchainTargets,
+) -> Vec<&'static str> {
+    let has_build_std = targets
+        .iter()
+        .flat_map(|t| t.architectures())
+        .any(|arch| toolchain_targets.needs_build_std(arch));
+
+    if !has_build_std {
         return vec![];
     }
 
-    // TODO: Check if the correct nightly toolchain itself is installed
     let mut rustup = command("rustup component list --toolchain nightly");
     rustup.stdout(Stdio::piped());
     // HACK: Silence error that toolchain is not installed
@@ -422,6 +546,38 @@ fn install_toolchains(toolchains: &[&str], silent: bool) -> Result<()> {
         install
             .execute()
             .map_err(|e| format!("Error while downloading toolchain {toolchain}: \n\t{e}"))?;
+
+        step.finish();
+    }
+    spinner.finish();
+
+    Ok(())
+}
+
+/// Attempts to install the given targets on the nightly toolchain
+fn install_nightly_targets(toolchains: &[&str], silent: bool) -> Result<()> {
+    if toolchains.is_empty() {
+        return Ok(());
+    };
+
+    let multi = silent.not().then(MultiProgress::new);
+    let spinner = silent
+        .not()
+        .then(|| MainSpinner::with_message("Installing Nightly Targets...".to_owned()));
+    multi.add(&spinner);
+    spinner.start();
+    for toolchain in toolchains {
+        let mut install = Command::new("rustup");
+        install.args(["target", "install", toolchain, "--toolchain", "nightly"]);
+        install.stdin(Stdio::null());
+
+        let step = silent.not().then(|| CommandSpinner::with_command(&install));
+        multi.add(&step);
+        step.start();
+
+        install
+            .execute()
+            .map_err(|e| format!("Error while installing nightly target {toolchain}: \n\t{e}"))?;
 
         step.finish();
     }
@@ -532,7 +688,7 @@ fn generate_bindings_with_output(
     mode: Mode,
     lib_type: LibType,
     config: &Config,
-) -> Result<()> {
+) -> Result<String> {
     run_step(config, "Generating Swift bindings...", || {
         let lib_file = library_file_name(lib_name, lib_type);
         let target = metadata().target_dir();
@@ -555,8 +711,9 @@ fn build_with_output(
     lib_type: LibType,
     config: &Config,
     features: &FeatureOptions,
+    toolchain_targets: &ToolchainTargets,
 ) -> Result<()> {
-    let mut commands = target.commands(lib_name, mode, lib_type, features);
+    let mut commands = target.commands(lib_name, mode, lib_type, features, toolchain_targets);
     for command in &mut commands {
         command.env("CARGO_TERM_COLOR", "always");
     }
@@ -570,11 +727,13 @@ fn build_with_output(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_xcframework_with_output(
     targets: &[Target],
     lib_name: &str,
     package_name: &str,
     xcframework_name: &str,
+    ffi_module_name: &str,
     mode: Mode,
     lib_type: LibType,
     config: &Config,
@@ -589,6 +748,7 @@ fn create_xcframework_with_output(
             targets,
             lib_name,
             xcframework_name,
+            ffi_module_name,
             &generated_dir,
             &output_dir,
             mode,
@@ -602,12 +762,22 @@ fn create_package_with_output(
     package_name: &str,
     xcframework_name: &str,
     disable_warnings: bool,
+    platforms: &[PlatformSpec],
+    swift_tools_version: &str,
     config: &Config,
 ) -> Result<()> {
     run_step(
         config,
         format!("Creating Swift Package '{package_name}'..."),
-        || create_swiftpackage(package_name, xcframework_name, disable_warnings),
+        || {
+            create_swiftpackage(
+                package_name,
+                xcframework_name,
+                disable_warnings,
+                platforms,
+                swift_tools_version,
+            )
+        },
     )?;
 
     let spinner = config.silent.not().then(|| {

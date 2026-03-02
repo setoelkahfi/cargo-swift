@@ -62,7 +62,14 @@ enum Action {
         // Initialize the project without any explanatory boilerplate code
         plain: bool,
 
+        #[arg(long = "udl")]
+        // Use .udl files instead of macros to declare which types and functions should be exported
+        // for use in Swift
+        udl: bool,
+
         #[arg(long = "macro")]
+        // (Deprecated) This flag is no longer neccessary, as this is the default mode. This flag
+        // is ignored now and will be removed in future releases
         // Initialize the project as a macro-only crate without .udl files
         macro_only: bool,
     },
@@ -71,8 +78,9 @@ enum Action {
     /// Package Rust crate in current directory as Swift package
     ///
     Package {
-        #[arg(short, long, trailing_var_arg = true, num_args = 1..=4, ignore_case = true)]
-        platforms: Option<Vec<package::Platform>>,
+        #[arg(short, long, trailing_var_arg = true, num_args = 1..=4, ignore_case = true, value_name = "PLATFORM[@MIN_VERSION]", value_parser = package::PlatformSpecParser)]
+        /// Platforms with optional minimum supported versions. Versions default to 2019, e. g. macos@10_15 or ios@13
+        platforms: Option<Vec<package::PlatformSpec>>,
 
         #[arg(long)]
         /// Build package for the specified target triplet only.
@@ -81,7 +89,9 @@ enum Action {
         #[arg(short = 'n', long = "name")]
         package_name: Option<String>,
 
-        #[arg(short ='f', long = "xcframework")]
+        #[arg(long)]
+        /// (Deprecated) This flag is deprecated and will be removed in future releases.
+        /// The xcframework name is now derived from the FFI module name in uniffi.toml.
         xcframework_name: Option<String>,
 
         #[arg(short, long)]
@@ -108,6 +118,9 @@ enum Action {
 
         #[arg(long)]
         no_default_features: bool,
+
+        #[arg(long, default_value = "5.5")]
+        swift_tools_version: String,
     },
 }
 
@@ -121,8 +134,9 @@ fn main() -> ExitCode {
             vcs,
             lib_type,
             plain,
-            macro_only,
-        } => init::run(crate_name, config, vcs, lib_type, plain, macro_only),
+            macro_only: _,
+            udl,
+        } => init::run(crate_name, config, vcs, lib_type, plain, !udl),
 
         Action::Package {
             platforms,
@@ -136,6 +150,7 @@ fn main() -> ExitCode {
             features,
             all_features,
             no_default_features,
+            swift_tools_version,
         } => package::run(
             platforms,
             target.as_deref(),
@@ -151,6 +166,7 @@ fn main() -> ExitCode {
                 no_default_features,
             },
             skip_toolchains_check,
+            &swift_tools_version,
         ),
     };
 
